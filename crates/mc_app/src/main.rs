@@ -145,18 +145,19 @@ struct MaterialCreatorApp {
     /// this app otherwise never does between nodes.
     perf_overlay_enabled: bool,
 
-    /// The node the Parameters panel edits — the "pinned" node. Only
-    /// changes on a deliberate action: double-clicking a node, the node
-    /// header's own "Show in Parameters / 2D View" dot, or creating/adding
-    /// a node (which naturally becomes both pinned and previewed at once).
-    /// A single click on a node, by contrast, only moves `preview_node` —
-    /// the owner's own request, so clicking around the graph to compare
-    /// outputs in the 2D View doesn't keep yanking the Parameters panel
-    /// away from whatever you're actually mid-edit on.
+    /// The node the Parameters panel edits. Moves on a plain single click,
+    /// not just the deliberate actions that also move `preview_node` — see
+    /// that field's own doc comment for the full reasoning.
     selected: Option<mc_core::NodeId>,
-    /// The node the 2D View shows. Moves on a plain single click/drag, not
-    /// just the deliberate actions that also move `selected` — see that
-    /// field's own doc comment for the full reasoning.
+    /// The node the 2D View shows — the "pinned" preview. Only changes on
+    /// a deliberate action: double-clicking a node, the node header's own
+    /// "Show in Parameters / 2D View" dot, or creating/adding a node
+    /// (which naturally becomes both pinned-preview and selected at once).
+    /// A single click on a node, by contrast, only moves `selected` — the
+    /// owner's own request (reversed from this app's original behavior,
+    /// where a single click moved the preview instead), so clicking
+    /// around the graph to tweak params doesn't keep yanking the 2D View
+    /// away from whatever you're actually comparing outputs against.
     preview_node: Option<mc_core::NodeId>,
     /// Which of `preview_node`'s own output ports to preview in the 2D
     /// View, for a node with more than one (currently just Thread) —
@@ -1082,20 +1083,66 @@ impl eframe::App for MaterialCreatorApp {
         // those keys keep doing normal text editing instead of being
         // hijacked into graph-wide actions.
         if ui.memory(|m| m.focused()).is_none() {
-            let (select_all, delete_pressed, new_pressed, open_pressed, save_pressed) =
-                ui.ctx().input(|i| {
-                    (
-                        i.modifiers.command && i.key_pressed(egui::Key::A),
-                        i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
-                        i.modifiers.command && i.key_pressed(egui::Key::N),
-                        i.modifiers.command && i.key_pressed(egui::Key::O),
-                        i.modifiers.command && i.key_pressed(egui::Key::S),
-                    )
-                });
-            // Shift+Cmd+S (Save As) vs. plain Cmd+S (Save): read `modifiers`
-            // separately from the tuple above, since `key_pressed` already
-            // consumed the event by the time `save_pressed` is true.
+            let (
+                select_all,
+                delete_pressed,
+                new_pressed,
+                open_pressed,
+                save_pressed,
+                undo_pressed,
+                redo_pressed,
+            ) = ui.ctx().input(|i| {
+                (
+                    i.modifiers.command && i.key_pressed(egui::Key::A),
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                    i.modifiers.command && i.key_pressed(egui::Key::N),
+                    i.modifiers.command && i.key_pressed(egui::Key::O),
+                    i.modifiers.command && i.key_pressed(egui::Key::S),
+                    i.modifiers.command && i.key_pressed(egui::Key::Z),
+                    i.modifiers.command && i.key_pressed(egui::Key::Y),
+                )
+            });
+            // Cmd+C never reaches `key_pressed(Key::C)` at all: egui-winit's
+            // own `on_keyboard_input` special-cases Cmd+C/Cmd+X/Cmd+V into
+            // `Event::Copy`/`Event::Cut`/`Event::Paste` and returns early,
+            // *never* pushing the underlying `Event::Key` a plain
+            // `key_pressed` check looks for (confirmed by reading
+            // egui-winit-0.36.2/src/lib.rs's own `on_keyboard_input`/
+            // `is_copy_command` — Z/Y have no such special case, which is
+            // why Cmd+Z/Cmd+Y work with the ordinary check above and Cmd+C
+            // silently never did). Has to be read as its own event instead.
+            let copy_pressed = ui
+                .ctx()
+                .input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+            // Shift+Cmd+S (Save As) vs. plain Cmd+S (Save), and Shift+Cmd+Z
+            // (Redo) vs. plain Cmd+Z (Undo): read `modifiers` separately from
+            // the tuple above, since `key_pressed` already consumed the key
+            // event by the time `save_pressed`/`undo_pressed` is true. Cmd+Y
+            // is also accepted for Redo (common on Windows/Linux) regardless
+            // of Shift.
             let save_as = save_pressed && ui.ctx().input(|i| i.modifiers.shift);
+            let redo_pressed =
+                redo_pressed || (undo_pressed && ui.ctx().input(|i| i.modifiers.shift));
+            let undo_pressed = undo_pressed && !ui.ctx().input(|i| i.modifiers.shift);
+
+            if undo_pressed {
+                self.history.undo(&mut self.graph);
+            }
+            if redo_pressed {
+                self.history.redo(&mut self.graph);
+            }
+            if copy_pressed {
+                let count =
+                    canvas::copy_selection_to_clipboard(ui.ctx(), &self.graph, &mut self.canvas);
+                if count > 0 {
+                    self.toasts.info(format!(
+                        "Copied {count} node{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                } else {
+                    self.toasts.info("Nothing selected to copy");
+                }
+            }
 
             if select_all {
                 self.canvas.selected = self.graph.nodes().map(|(id, _)| id).collect();
@@ -1143,6 +1190,27 @@ impl eframe::App for MaterialCreatorApp {
                     self.do_save();
                 }
             }
+        }
+
+        // Paste reads the `Event::Paste` the OS/egui clipboard bridge
+        // produces this frame and no-ops if it isn't one of our own
+        // clipboard payloads — unconditional (not inside the focused-field
+        // guard above) is deliberate: it only ever acts on JSON that parses
+        // as a `ClipboardPayload`, so pasting ordinary text into a focused
+        // parameter field or the add-node search box is untouched.
+        let pasted_count = canvas::paste_from_clipboard(
+            ui.ctx(),
+            &mut self.graph,
+            &mut self.history,
+            &mut self.canvas,
+            &mut self.selected,
+            &mut self.preview_node,
+        );
+        if pasted_count > 0 {
+            self.toasts.info(format!(
+                "Pasted {pasted_count} node{}",
+                if pasted_count == 1 { "" } else { "s" }
+            ));
         }
 
         if self.add_node_menu.is_none() {
